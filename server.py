@@ -131,21 +131,16 @@ def parse_progress(line):
     return pct, speed
 
 def run_job(job_id):
-    if not slots.acquire(blocking=False):
-        with lock:
-            m = jobs.get(job_id)
-            if m:
-                m["status"] = "queued"
-                m["updatedAt"] = now()
-                write_meta(m)
-        def later():
-            with slots:
-                execute_job(job_id)
-        threading.Thread(target=later, daemon=True).start()
-        return
+    with lock:
+        m = jobs.get(job_id)
+        if m and m.get("status") not in {"cancelled", "ready"}:
+            m["status"] = "queued"
+            m["updatedAt"] = now()
+            write_meta(m)
     threading.Thread(target=execute_job, args=(job_id,), daemon=True).start()
 
 def execute_job(job_id):
+    slots.acquire()
     try:
         with lock:
             m = jobs.get(job_id)
@@ -381,7 +376,15 @@ class Handler(BaseHTTPRequestHandler):
                         self.send_json(200, enrich(m)); return
                     except Exception as e:
                         self.send_json(409, {"error": f"resume failed: {e}"}); return
-                self.send_json(409, {"error": "job is not paused"}); return
+                if m.get("status") == "interrupted":
+                    with lock:
+                        m["status"] = "queued"
+                        m["error"] = None
+                        m["updatedAt"] = now()
+                        write_meta(m)
+                    run_job(job_id)
+                    self.send_json(202, enrich(m)); return
+                self.send_json(409, {"error": "job is not paused or interrupted"}); return
             if action == "cancel":
                 pid = m.get("pid")
                 if pid:
