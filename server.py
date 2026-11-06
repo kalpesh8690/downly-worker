@@ -152,16 +152,36 @@ def parse_eta(value):
         return None
 
 def parse_progress(line):
-    # yt-dlp --newline example:
-    # [download]  12.3% of 20.00MiB at 1.2MiB/s ETA 00:15
+    # Prefer the machine-readable yt-dlp progress template.
+    if line.startswith("download:"):
+        parts = line.split("|", 5)
+        if len(parts) == 6:
+            _, pct_raw, bytes_raw, total_raw, speed_raw, eta_raw = parts
+            try:
+                pct = float(str(pct_raw).replace("%", "").strip()) if pct_raw not in {"NA", "N/A", ""} else None
+            except Exception:
+                pct = None
+            try:
+                downloaded = int(float(bytes_raw)) if bytes_raw not in {"NA", "N/A", ""} else None
+            except Exception:
+                downloaded = None
+            try:
+                total = int(float(total_raw)) if total_raw not in {"NA", "N/A", ""} else None
+            except Exception:
+                total = None
+            try:
+                speed = int(float(speed_raw)) if speed_raw not in {"NA", "N/A", ""} else None
+            except Exception:
+                speed = None
+            eta = parse_eta(eta_raw)
+            return pct, total, speed, eta, downloaded
+
     m = re.search(r"\[download\]\s+(\d+(?:\.\d+)?)%", line)
     pct = float(m.group(1)) if m else None
-
     total = None
     tm = re.search(r"\bof\s+(?:~\s*)?([0-9.]+\s*[KMGTP]?i?B)", line, re.I)
     if tm:
         total = parse_size(tm.group(1))
-
     sm = re.search(r"\bat\s+([0-9.]+)\s*([KMG]?i?B/s)", line, re.I)
     speed = None
     if sm:
@@ -169,13 +189,11 @@ def parse_progress(line):
         unit = sm.group(2).lower()
         mult = {"b/s":1,"kb/s":1000,"kib/s":1024,"mb/s":1000**2,"mib/s":1024**2,"gb/s":1000**3,"gib/s":1024**3}.get(unit, 1)
         speed = int(n * mult)
-
     eta = None
     em = re.search(r"\bETA\s+([0-9:]+)", line, re.I)
     if em:
         eta = parse_eta(em.group(1))
-
-    return pct, total, speed, eta
+    return pct, total, speed, eta, None
 
 def inspect_url(url):
     cmd = [
@@ -282,7 +300,7 @@ def execute_job(job_id):
         d = job_dir(job_id)
         out_tpl = str(d / "%(title).180B.%(ext)s")
         cmd = [
-            "yt-dlp", "--no-playlist", "--newline",
+            "yt-dlp", "--no-playlist", "--newline", "--progress-template", "download:%(progress.status)s|%(progress.percent)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.speed)s|%(progress.eta)s",
             "--continue", "--no-overwrites", "--no-cache-dir",
             "--retries", "10", "--fragment-retries", "10",
             "--retry-sleep", "http:linear=1::2",
@@ -316,7 +334,7 @@ def execute_job(job_id):
             line = line.rstrip()
             if line:
                 log.info("job=%s yt-dlp: %s", job_id, line)
-            pct, total, speed, eta = parse_progress(line)
+            pct, total, speed, eta, downloaded = parse_progress(line)
             with lock:
                 m = jobs.get(job_id)
                 if not m:
@@ -329,6 +347,8 @@ def execute_job(job_id):
                     m["speedBps"] = speed
                 if eta is not None:
                     m["etaSeconds"] = eta
+                if downloaded is not None:
+                    m["bytes"] = downloaded
                 # Inspect the growing part/final file for byte progress.
                 candidates = list(d.glob("*"))
                 files = [p for p in candidates if p.is_file() and p.name != "meta.json"]
