@@ -321,7 +321,7 @@ def execute_job(job_id):
         elif requested_format in {"best", "original"}:
             cmd += ["-f", "bv*+ba/b", "--merge-output-format", "mp4"]
         else:
-            cmd += ["-f", requested_format]
+            cmd += ["-f", requested_format, "--merge-output-format", "mp4"]
         cmd += [m["url"]]
 
         log.info("job=%s start url=%s audio_only=%s format=%s", job_id, m.get("url"), m.get("audio_only"), m.get("format"))
