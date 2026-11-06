@@ -286,6 +286,9 @@ def inspect_url(url):
             selector = fid + "+bestaudio/" + fid
         else:
             selector = fid
+        protocol = str(f.get("protocol") or "").lower()
+        progressive = protocol in {"http", "https"} and not f.get("fragments") and ext not in {"m3u8", "mpd"}
+        direct_url = f.get("url") if progressive and f.get("url") and re.match(r"^https?://", str(f.get("url"))) else None
         formats.append({
             "id": fid,
             "selector": selector,
@@ -300,8 +303,8 @@ def inspect_url(url):
             "acodec": acodec,
             "hasVideo": has_video,
             "hasAudio": has_audio,
-            "protocol": f.get("protocol"),
-            "directUrl": f.get("url") if f.get("url") and re.match(r"^https?://", str(f.get("url"))) else None,
+            "protocol": protocol,
+            "directUrl": direct_url,
             "manifestUrl": f.get("manifest_url") if f.get("manifest_url") and re.match(r"^https?://", str(f.get("manifest_url"))) else None,
         })
     formats.sort(key=lambda x: (
@@ -701,7 +704,7 @@ def stream_media(handler, query):
         yt_cmd = [
             "yt-dlp", "--no-playlist", "--no-warnings", "--no-cache-dir",
             "--retries", "10", "--fragment-retries", "10", "--socket-timeout", "30",
-            "--downloader", "ffmpeg", "-f", fmt, "-o", "-", url
+            "--downloader", "ffmpeg", "-f", fmt, "--merge-output-format", "mp4", "-o", "-", url
         ]
         output_cmd = None
 
