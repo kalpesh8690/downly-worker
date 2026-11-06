@@ -748,7 +748,7 @@ def stream_media(handler, query):
 
     handler.send_response(200)
     handler.send_header("Content-Type", mime)
-    handler.send_header("Content-Disposition", 'attachment; filename="' + filename.replace('"', "") + '"')
+    handler.send_header("Content-Disposition", content_disposition(filename))
     handler.send_header("Cache-Control", "no-store, no-transform")
     handler.send_header("X-Content-Type-Options", "nosniff")
     handler.send_header("Accept-Ranges", "none")
