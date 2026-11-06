@@ -121,18 +121,61 @@ def find_output(job_id):
         return None
     return max(candidates, key=lambda p: p.stat().st_mtime)
 
+def parse_size(value):
+    if not value:
+        return None
+    m = re.match(r"([0-9.]+)\s*([KMGTP]?i?B)", value.strip(), re.I)
+    if not m:
+        return None
+    n = float(m.group(1))
+    unit = m.group(2).lower()
+    mult = {
+        "b": 1, "kb": 1000, "kib": 1024, "mb": 1000**2, "mib": 1024**2,
+        "gb": 1000**3, "gib": 1024**3, "tb": 1000**4, "tib": 1024**4,
+        "pb": 1000**5, "pib": 1024**5,
+    }.get(unit, 1)
+    return int(n * mult)
+
+def parse_eta(value):
+    if not value or value in {"Unknown", "N/A", "--:--"}:
+        return None
+    parts = value.strip().split(":")
+    try:
+        if len(parts) == 3:
+            h, m, s = map(int, parts)
+            return h * 3600 + m * 60 + s
+        if len(parts) == 2:
+            m, s = map(int, parts)
+            return m * 60 + s
+        return int(float(value))
+    except Exception:
+        return None
+
 def parse_progress(line):
-    # yt-dlp --newline progress lines contain: [download]  12.3% of 20.00MiB at 1.2MiB/s ETA 00:15
+    # yt-dlp --newline example:
+    # [download]  12.3% of 20.00MiB at 1.2MiB/s ETA 00:15
     m = re.search(r"\[download\]\s+(\d+(?:\.\d+)?)%", line)
     pct = float(m.group(1)) if m else None
-    sm = re.search(r"at\s+([0-9.]+)\s*([KMG]?i?B/s)", line, re.I)
+
+    total = None
+    tm = re.search(r"\bof\s+(?:~\s*)?([0-9.]+\s*[KMGTP]?i?B)", line, re.I)
+    if tm:
+        total = parse_size(tm.group(1))
+
+    sm = re.search(r"\bat\s+([0-9.]+)\s*([KMG]?i?B/s)", line, re.I)
     speed = None
     if sm:
         n = float(sm.group(1))
         unit = sm.group(2).lower()
         mult = {"b/s":1,"kb/s":1000,"kib/s":1024,"mb/s":1000**2,"mib/s":1024**2,"gb/s":1000**3,"gib/s":1024**3}.get(unit, 1)
         speed = int(n * mult)
-    return pct, speed
+
+    eta = None
+    em = re.search(r"\bETA\s+([0-9:]+)", line, re.I)
+    if em:
+        eta = parse_eta(em.group(1))
+
+    return pct, total, speed, eta
 
 def run_job(job_id):
     with lock:
@@ -192,25 +235,33 @@ def execute_job(job_id):
             line = line.rstrip()
             if line:
                 log.info("job=%s yt-dlp: %s", job_id, line)
-            pct, speed = parse_progress(line)
+            pct, total, speed, eta = parse_progress(line)
             with lock:
                 m = jobs.get(job_id)
                 if not m:
                     break
                 if pct is not None:
                     m["progress"] = pct
-                if speed:
+                if total:
+                    m["totalBytes"] = total
+                if speed is not None:
                     m["speedBps"] = speed
+                if eta is not None:
+                    m["etaSeconds"] = eta
                 # Inspect the growing part/final file for byte progress.
                 candidates = list(d.glob("*"))
                 files = [p for p in candidates if p.is_file() and p.name != "meta.json"]
                 if files:
                     largest = max(files, key=lambda p: p.stat().st_size)
                     try:
-                        m["bytes"] = largest.stat().st_size
-                        m["filename"] = largest.name
+                        file_bytes = largest.stat().st_size
+                        m["bytes"] = file_bytes
+                        if not m.get("filename"):
+                            m["filename"] = largest.name
                     except OSError:
                         pass
+                if m.get("totalBytes") and m.get("progress") is not None:
+                    m["bytes"] = max(int(m.get("bytes") or 0), int(m["totalBytes"] * float(m["progress"]) / 100))
                 m["updatedAt"] = now()
                 write_meta(m)
             if line.startswith("after_move:"):
