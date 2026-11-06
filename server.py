@@ -784,7 +784,7 @@ def json_body(handler):
     return json.loads(raw or b"{}")
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "DownlyWorker/2.0"
+    server_version = "DownlyWorker/2.1"
 
     def log_message(self, fmt, *args):
         message = fmt % args
@@ -815,7 +815,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         log.info("request GET %s", urlparse(self.path).path)
         if self.path == "/health":
-            self.send_json(200, {"ok": True, "service": "downly-worker", "version": "2.0.0", "jobs": len(jobs), "maxJobs": MAX_JOBS})
+            self.send_json(200, {"ok": True, "service": "downly-worker", "version": "2.1.0", "jobs": len(jobs), "maxJobs": MAX_JOBS, "maxStreams": MAX_STREAMS})
             return
         if not self.require_auth():
             return
