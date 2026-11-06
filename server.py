@@ -879,6 +879,18 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(400, {"error": str(e)})
             return
 
+        if parts == ["v1", "stream"]:
+            stream_values = {
+                "url": [str(body.get("url") or "")],
+                "direct_url": [str(body.get("direct_url") or "")],
+                "referer": [str(body.get("referer") or body.get("url") or "")],
+                "format": [str(body.get("format") or "best")],
+                "audio_only": ["true" if body.get("audio_only") is True or str(body.get("audio_only")).lower() == "true" else "false"],
+                "filename": [str(body.get("filename") or "")],
+            }
+            stream_media(self, stream_values)
+            return
+
         if parts == ["v1", "inspect"]:
             url = str(body.get("url", "")).strip()
             try:
