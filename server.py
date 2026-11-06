@@ -177,6 +177,87 @@ def parse_progress(line):
 
     return pct, total, speed, eta
 
+def inspect_url(url):
+    cmd = [
+        "yt-dlp", "--dump-single-json", "--skip-download", "--no-playlist",
+        "--no-warnings", "--no-cache-dir", "--socket-timeout", "20", url
+    ]
+    log.info("inspect url=%s", url)
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
+    output = proc.stdout or ""
+    if proc.returncode != 0:
+        lines = [x.strip() for x in output.splitlines() if x.strip()]
+        raise RuntimeError(lines[-1] if lines else "Unable to inspect this media URL")
+    raw = json.loads(output)
+    formats = []
+    seen = set()
+    for f in raw.get("formats") or []:
+        fid = str(f.get("format_id") or "")
+        if not fid or fid in seen:
+            continue
+        seen.add(fid)
+        height = f.get("height")
+        width = f.get("width")
+        vcodec = str(f.get("vcodec") or "none")
+        acodec = str(f.get("acodec") or "none")
+        has_video = vcodec != "none"
+        has_audio = acodec != "none"
+        ext = str(f.get("ext") or "")
+        if not has_video and not has_audio:
+            continue
+        if has_video:
+            label = (str(height) + "p") if height else (str(width) + "w" if width else "Video")
+            if f.get("fps"):
+                label += " " + str(f.get("fps")) + "fps"
+        else:
+            label = "Audio"
+        if ext:
+            label += " · " + ext.upper()
+        if has_video and not has_audio:
+            selector = fid + "+bestaudio/" + fid
+        else:
+            selector = fid
+        formats.append({
+            "id": fid,
+            "selector": selector,
+            "label": label,
+            "ext": ext,
+            "height": height,
+            "width": width,
+            "fps": f.get("fps"),
+            "filesize": f.get("filesize") or f.get("filesize_approx"),
+            "tbr": f.get("tbr"),
+            "vcodec": vcodec,
+            "acodec": acodec,
+            "hasVideo": has_video,
+            "hasAudio": has_audio,
+            "protocol": f.get("protocol"),
+        })
+    formats.sort(key=lambda x: (
+        0 if x["hasVideo"] else 1,
+        -(int(x["height"] or 0)),
+        -(float(x["tbr"] or 0)),
+        x["ext"] or "zzz"
+    ))
+    return {
+        "ok": True,
+        "url": url,
+        "webpageUrl": raw.get("webpage_url") or url,
+        "id": raw.get("id"),
+        "title": raw.get("title") or "Untitled media",
+        "author": raw.get("uploader") or raw.get("channel") or raw.get("creator"),
+        "thumbnail": raw.get("thumbnail"),
+        "duration": raw.get("duration"),
+        "durationString": raw.get("duration_string"),
+        "description": raw.get("description"),
+        "viewCount": raw.get("view_count"),
+        "uploadDate": raw.get("upload_date"),
+        "extractor": raw.get("extractor_key") or raw.get("extractor"),
+        "ext": raw.get("ext"),
+        "formatCount": len(formats),
+        "formats": formats[:120],
+    }
+
 def run_job(job_id):
     with lock:
         m = jobs.get(job_id)
@@ -397,6 +478,21 @@ class Handler(BaseHTTPRequestHandler):
             body = json_body(self)
         except Exception as e:
             self.send_json(400, {"error": str(e)})
+            return
+
+        if parts == ["v1", "inspect"]:
+            url = str(body.get("url", "")).strip()
+            if not re.match(r"^https?://", url, re.I):
+                self.send_json(400, {"error": "url must be http/https"})
+                return
+            try:
+                data = inspect_url(url)
+                self.send_json(200, data)
+            except subprocess.TimeoutExpired:
+                self.send_json(504, {"error": "Media inspection timed out"})
+            except Exception as e:
+                log.error("inspect failed url=%s error=%s", url, e)
+                self.send_json(422, {"error": str(e) or "Unable to inspect media URL"})
             return
 
         if parts == ["v1", "jobs"]:
