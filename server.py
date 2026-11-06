@@ -256,6 +256,8 @@ def inspect_url(url):
             "hasVideo": has_video,
             "hasAudio": has_audio,
             "protocol": f.get("protocol"),
+            "directUrl": f.get("url") if f.get("url") and re.match(r"^https?://", str(f.get("url"))) else None,
+            "manifestUrl": f.get("manifest_url") if f.get("manifest_url") and re.match(r"^https?://", str(f.get("manifest_url"))) else None,
         })
     formats.sort(key=lambda x: (
         0 if x["hasVideo"] else 1,
@@ -281,6 +283,69 @@ def inspect_url(url):
         "formatCount": len(formats),
         "formats": formats[:120],
     }
+
+class MediaPageParser(HTMLParser):
+    def __init__(self, base_url):
+        super().__init__(convert_charrefs=True)
+        self.base_url = base_url
+        self.items = []
+        self.title = ""
+        self._in_title = False
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag.lower() == "title":
+            self._in_title = True
+        for key in ("src", "href", "content", "data-src", "data-video", "data-url"):
+            value = attrs.get(key)
+            if value and isinstance(value, str):
+                self._add(value, tag, attrs.get("type") or attrs.get("data-type"))
+
+    def handle_endtag(self, tag):
+        if tag.lower() == "title":
+            self._in_title = False
+
+    def handle_data(self, data):
+        if self._in_title:
+            self.title += data
+
+    def _add(self, value, tag="", kind=""):
+        value = value.strip()
+        if not value or value.startswith(("data:", "blob:", "javascript:", "#")):
+            return
+        try:
+            absolute = urljoin(self.base_url, value)
+        except Exception:
+            return
+        if not re.match(r"^https?://", absolute, re.I):
+            return
+        lower = absolute.lower().split("?", 1)[0]
+        ext = Path(urlparse(lower).path).suffix.lower().lstrip(".")
+        mime_hint = (kind or "").lower()
+        media_exts = {"mp4":"video/mp4","webm":"video/webm","m4v":"video/x-m4v","mov":"video/quicktime","mkv":"video/x-matroska","mp3":"audio/mpeg","m4a":"audio/mp4","aac":"audio/aac","wav":"audio/wav","ogg":"audio/ogg","ogv":"video/ogg","m3u8":"application/vnd.apple.mpegurl","mpd":"application/dash+xml"}
+        is_media = ext in media_exts or "video/" in mime_hint or "audio/" in mime_hint or "mpegurl" in mime_hint or "dash" in mime_hint
+        if not is_media:
+            return
+        if not any(x["url"] == absolute for x in self.items):
+            self.items.append({"url": absolute, "extension": ext or None, "mime": media_exts.get(ext) or mime_hint or None, "kind": "hls" if ext == "m3u8" else "dash" if ext == "mpd" else "direct"})
+
+def crawl_media_page(url):
+    req = Request(url, headers={"User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36", "Accept": "text/html,application/xhtml+xml"})
+    with urlopen(req, timeout=20) as resp:
+        content_type = (resp.headers.get("Content-Type") or "").lower()
+        final_url = resp.geturl()
+        raw = resp.read(3 * 1024 * 1024)
+    if "text/html" not in content_type and "application/xhtml" not in content_type:
+        ext = Path(urlparse(final_url).path).suffix.lower().lstrip(".")
+        return {"ok": True, "pageUrl": final_url, "title": Path(urlparse(final_url).path).name or "Media", "items": [{"url": final_url, "extension": ext, "mime": content_type, "kind": "direct"}]}
+    parser = MediaPageParser(final_url)
+    parser.feed(raw.decode("utf-8", "replace"))
+    # Also catch media URLs embedded in JSON/config/script text.
+    text = raw.decode("utf-8", "replace")
+    patterns = re.findall(r'https?[^"\'<>\s]+\.(?:mp4|webm|m4v|mov|mkv|mp3|m4a|m3u8|mpd)(?:\?[^"\'<>\s]*)?', text, re.I)
+    for value in patterns:
+        parser._add(value, "script", "")
+    return {"ok": True, "pageUrl": final_url, "title": parser.title.strip() or "Detected media", "items": parser.items[:100], "count": len(parser.items)}
 
 def run_job(job_id):
     with lock:
@@ -566,6 +631,18 @@ class Handler(BaseHTTPRequestHandler):
         if not self.require_auth():
             return
         parsed = urlparse(self.path)
+        if parsed.path == "/v1/crawl":
+            query = parse_qs(parsed.query)
+            page_url = (query.get("url") or [""])[0].strip()
+            if not re.match(r"^https?://", page_url, re.I):
+                self.send_json(400, {"ok": False, "error": "url must be http/https"})
+                return
+            try:
+                self.send_json(200, crawl_media_page(page_url))
+            except Exception as e:
+                log.exception("crawl failed url=%s", page_url)
+                self.send_json(422, {"ok": False, "error": str(e) or "Unable to crawl this page"})
+            return
         if parsed.path == "/v1/stream":
             stream_media(self, parse_qs(parsed.query))
             return
