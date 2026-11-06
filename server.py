@@ -561,6 +561,7 @@ def stream_media(handler, query):
             headers["Referer"] = referer
         if handler.headers.get("Range"):
             headers["Range"] = handler.headers.get("Range")
+        response_started = False
         try:
             upstream = safe_opener.open(Request(direct_url, headers=headers), timeout=30)
             validate_public_url(upstream.geturl())
@@ -574,6 +575,7 @@ def stream_media(handler, query):
                 if upstream.headers.get(header):
                     handler.send_header(header, upstream.headers.get(header))
             handler.end_headers()
+            response_started = True
             sent = 0
             while True:
                 chunk = upstream.read(1024 * 1024)
@@ -587,7 +589,7 @@ def stream_media(handler, query):
             log.info("direct stream disconnected/error: %s", e)
         except Exception as e:
             log.exception("direct stream failed")
-            if not getattr(handler, "_headers_sent", False):
+            if not response_started:
                 try:
                     handler.send_json(502, {"error": "Direct source could not be streamed. Retry with conversion."})
                 except Exception:
