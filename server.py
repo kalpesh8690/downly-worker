@@ -32,7 +32,7 @@ import uuid
 import logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs, unquote
 
 TOKEN = os.environ.get("WORKER_TOKEN", "")
 HOST = os.environ.get("HOST", "127.0.0.1")
@@ -424,6 +424,92 @@ def execute_job(job_id):
     finally:
         slots.release()
 
+def stream_media(handler, query):
+    url = (query.get("url") or [""])[0].strip()
+    requested_format = (query.get("format") or ["best"])[0].strip() or "best"
+    audio_only = (query.get("audio_only") or ["false"])[0].lower() == "true"
+    filename = safe_name(unquote((query.get("filename") or [""])[0]).strip())
+    if not re.match(r"^https?://", url, re.I):
+        handler.send_json(400, {"error": "url must be http/https"})
+        return
+    if len(requested_format) > 300 or any(x in requested_format for x in [";", "\n", "\r"]):
+        handler.send_json(400, {"error": "invalid format selector"})
+        return
+    if not filename:
+        filename = "downly-download.mp3" if audio_only else "downly-download.mp4"
+    if audio_only:
+        if not filename.lower().endswith(".mp3"):
+            filename += ".mp3"
+        mime = "audio/mpeg"
+        cmd = [
+            "yt-dlp", "--no-playlist", "--no-warnings", "--no-cache-dir",
+            "--retries", "10", "--fragment-retries", "10", "--socket-timeout", "30",
+            "-f", "ba/b", "-o", "-", url
+        ]
+    else:
+        if not filename.lower().endswith((".mp4", ".webm", ".mkv", ".mov")):
+            filename += ".mp4"
+        mime = mimetypes.guess_type(filename)[0] or "video/mp4"
+        fmt = requested_format if requested_format not in {"best", "original"} else "bv*+ba/b"
+        cmd = [
+            "yt-dlp", "--no-playlist", "--no-warnings", "--no-cache-dir",
+            "--retries", "10", "--fragment-retries", "10", "--socket-timeout", "30",
+            "--downloader", "ffmpeg", "-f", fmt, "-o", "-", url
+        ]
+
+    log.info("stream start url=%s audio_only=%s format=%s filename=%s", url, audio_only, requested_format, filename)
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL, bufsize=0, start_new_session=True
+        )
+    except Exception as e:
+        log.exception("stream spawn failed")
+        handler.send_json(500, {"error": "Unable to start media stream", "detail": str(e)})
+        return
+
+    def drain_stderr():
+        try:
+            for raw in proc.stderr:
+                line = raw.decode("utf-8", "replace").rstrip()
+                if line:
+                    log.info("stream yt-dlp: %s", line)
+        except Exception:
+            pass
+
+    threading.Thread(target=drain_stderr, daemon=True).start()
+    handler.send_response(200)
+    handler.send_header("Content-Type", mime)
+    handler.send_header("Content-Disposition", 'attachment; filename="' + filename.replace('"', "") + '"')
+    handler.send_header("Cache-Control", "no-store, no-transform")
+    handler.send_header("X-Content-Type-Options", "nosniff")
+    handler.send_header("Accept-Ranges", "none")
+    handler.end_headers()
+
+    sent = 0
+    try:
+        while True:
+            chunk = proc.stdout.read(1024 * 1024)
+            if not chunk:
+                break
+            handler.wfile.write(chunk)
+            handler.wfile.flush()
+            sent += len(chunk)
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        log.info("stream client disconnected after %s bytes", sent)
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except Exception:
+            pass
+    finally:
+        try:
+            rc = proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            try: os.killpg(proc.pid, signal.SIGKILL)
+            except Exception: pass
+            rc = -9
+        log.info("stream finished bytes=%s rc=%s", sent, rc)
+
 def auth(handler):
     if not TOKEN:
         return False
@@ -465,7 +551,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not self.require_auth():
             return
-        parts = [x for x in urlparse(self.path).path.split("/") if x]
+        parsed = urlparse(self.path)
+        if parsed.path == "/v1/stream":
+            stream_media(self, parse_qs(parsed.query))
+            return
+        parts = [x for x in parsed.path.split("/") if x]
         if len(parts) == 2 and parts[0] == "v1" and parts[1] == "jobs":
             with lock:
                 data = [enrich(v) for v in jobs.values()]
