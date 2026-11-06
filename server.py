@@ -34,7 +34,7 @@ import uuid
 import logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs, unquote, urljoin
+from urllib.parse import urlparse, parse_qs, unquote, urljoin, quote
 from urllib.request import Request, urlopen, build_opener, HTTPRedirectHandler
 from html.parser import HTMLParser
 
@@ -109,6 +109,12 @@ def meta_path(job_id):
 def safe_name(name):
     name = re.sub(r"[\\/\x00-\x1f]", "_", name or "download")
     return name[:180] or "download"
+
+def content_disposition(name):
+    filename = safe_name(name)
+    fallback = re.sub(r"[^A-Za-z0-9._ -]", "_", filename).strip(" .") or "download"
+    encoded = quote(filename.encode("utf-8"))
+    return 'attachment; filename="' + fallback.replace('"', "_") + '"; filename*=UTF-8\'\'' + encoded
 
 def write_meta(meta):
     p = meta_path(meta["id"])
@@ -646,7 +652,7 @@ def stream_media(handler, query):
             validate_public_url(upstream.geturl())
             handler.send_response(upstream.status)
             handler.send_header("Content-Type", upstream.headers.get("Content-Type") or "application/octet-stream")
-            handler.send_header("Content-Disposition", 'attachment; filename="' + filename.replace('"', "") + '"')
+            handler.send_header("Content-Disposition", content_disposition(filename))
             handler.send_header("Cache-Control", "no-store, no-transform")
             handler.send_header("X-Content-Type-Options", "nosniff")
             handler.send_header("Accept-Ranges", upstream.headers.get("Accept-Ranges", "none"))
@@ -1004,7 +1010,7 @@ class Handler(BaseHTTPRequestHandler):
         length = end - start + 1
         self.send_response(status)
         self.send_header("Content-Type", mime)
-        self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+        self.send_header("Content-Disposition", content_disposition(name))
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Length", str(length))
         self.send_header("X-Downly-Extension", m.get("extension") or p.suffix.lstrip("."))
@@ -1039,7 +1045,7 @@ threading.Thread(target=cleanup_loop, daemon=True).start()
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("WORKER_TOKEN is required")
-    print(f"Downly Worker 2.0 listening on http://{HOST}:{PORT}")
+    print(f"Downly Worker 2.1 listening on http://{HOST}:{PORT}")
     print(f"Download store: {ROOT}")
     print(f"Max concurrent jobs: {MAX_JOBS}")
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
