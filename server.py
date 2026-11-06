@@ -59,6 +59,13 @@ slots = threading.Semaphore(MAX_JOBS)
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".flv"}
 AUDIO_EXTS = {".mp3", ".m4a", ".opus", ".aac", ".wav", ".flac", ".ogg"}
 
+def safe_log_url(value):
+    try:
+        parsed = urlparse(str(value or ""))
+        return parsed.scheme + "://" + (parsed.hostname or "") + parsed.path
+    except Exception:
+        return "<invalid-url>"
+
 def validate_public_url(value):
     parsed = urlparse(str(value or "").strip())
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -244,7 +251,7 @@ def inspect_url(url):
         "yt-dlp", "--dump-single-json", "--skip-download", "--no-playlist",
         "--no-warnings", "--no-cache-dir", "--socket-timeout", "20", url
     ]
-    log.info("inspect url=%s", url)
+    log.info("inspect url=%s", safe_log_url(url))
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
     output = proc.stdout or ""
     if proc.returncode != 0:
@@ -401,7 +408,7 @@ def crawl_media_page(url, max_pages=6):
                 validate_public_url(final_url)
                 raw = resp.read(3 * 1024 * 1024)
         except Exception as e:
-            log.info("crawler skipped page=%s reason=%s", page_url, e)
+            log.info("crawler skipped page=%s reason=%s", safe_log_url(page_url), e)
             continue
 
         pages_scanned += 1
@@ -498,7 +505,7 @@ def execute_job(job_id):
             cmd += ["-f", requested_format, "--merge-output-format", "mp4"]
         cmd += [m["url"]]
 
-        log.info("job=%s start url=%s audio_only=%s format=%s", job_id, m.get("url"), m.get("audio_only"), m.get("format"))
+        log.info("job=%s start url=%s audio_only=%s format=%s", job_id, safe_log_url(m.get("url")), m.get("audio_only"), m.get("format"))
         log.info("job=%s command=%s", job_id, " ".join(cmd[:-1]) + " <url>")
         proc = subprocess.Popen(
             cmd, cwd=str(d), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -698,7 +705,7 @@ def stream_media(handler, query):
         ]
         output_cmd = None
 
-    log.info("stream start url=%s audio_only=%s format=%s filename=%s", url, audio_only, requested_format, filename)
+    log.info("stream start url=%s audio_only=%s format=%s filename=%s", safe_log_url(url), audio_only, requested_format, filename)
     try:
         yt = subprocess.Popen(
             yt_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -780,7 +787,15 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "DownlyWorker/2.0"
 
     def log_message(self, fmt, *args):
-        print("[%s] %s" % (time.strftime("%H:%M:%S"), fmt % args))
+        message = fmt % args
+        try:
+            raw_path = self.path
+            parsed_path = urlparse(raw_path).path
+            if raw_path and parsed_path:
+                message = message.replace(raw_path, parsed_path)
+        except Exception:
+            pass
+        print("[%s] %s" % (time.strftime("%H:%M:%S"), message))
 
     def send_json(self, code, data):
         body = json.dumps(data, ensure_ascii=False).encode()
@@ -798,7 +813,7 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def do_GET(self):
-        log.info("request GET %s", self.path)
+        log.info("request GET %s", urlparse(self.path).path)
         if self.path == "/health":
             self.send_json(200, {"ok": True, "service": "downly-worker", "version": "2.0.0", "jobs": len(jobs), "maxJobs": MAX_JOBS})
             return
@@ -814,7 +829,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 self.send_json(200, crawl_media_page(page_url))
             except Exception as e:
-                log.exception("crawl failed url=%s", page_url)
+                log.exception("crawl failed page=%s", safe_log_url(page_url))
                 self.send_json(422, {"ok": False, "error": str(e) or "Unable to crawl this page"})
             return
         if parsed.path == "/v1/stream":
@@ -841,7 +856,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(404, {"error": "not found"})
 
     def do_HEAD(self):
-        log.info("request HEAD %s", self.path)
+        log.info("request HEAD %s", urlparse(self.path).path)
         if not self.require_auth():
             return
         parts = [x for x in urlparse(self.path).path.split("/") if x]
@@ -851,7 +866,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(404); self.end_headers()
 
     def do_POST(self):
-        log.info("request POST %s", self.path)
+        log.info("request POST %s", urlparse(self.path).path)
         if not self.require_auth():
             return
         parts = [x for x in urlparse(self.path).path.split("/") if x]
@@ -870,7 +885,7 @@ class Handler(BaseHTTPRequestHandler):
             except subprocess.TimeoutExpired:
                 self.send_json(504, {"error": "Media inspection timed out"})
             except Exception as e:
-                log.error("inspect failed url=%s error=%s", url, e)
+                log.error("inspect failed host_path=%s error=%s", safe_log_url(url), e)
                 self.send_json(422, {"error": str(e) or "Unable to inspect media URL"})
             return
 
