@@ -98,20 +98,26 @@ def enrich(meta):
     out = dict(meta)
     total = int(out.get("totalBytes") or 0)
     done = int(out.get("bytes") or 0)
-    if total:
+    stored_progress = out.get("progress")
+    if stored_progress is not None:
+        try:
+            out["progress"] = round(float(stored_progress), 2)
+        except Exception:
+            out["progress"] = None
+    elif total:
         out["progress"] = round(done * 100 / total, 2)
     else:
         out["progress"] = None
-    if out.get("startedAt") and done:
+
+    speed = int(out.get("speedBps") or 0)
+    if speed <= 0 and out.get("startedAt") and done:
         elapsed = max(0.001, time.time() - out["startedAt"])
-        out["speedBps"] = int(done / elapsed)
-        if total and out["speedBps"]:
-            out["etaSeconds"] = max(0, int((total - done) / out["speedBps"]))
-        else:
-            out["etaSeconds"] = None
-    else:
-        out["speedBps"] = int(out.get("speedBps") or 0)
-        out["etaSeconds"] = None
+        speed = int(done / elapsed)
+    out["speedBps"] = speed
+    eta = out.get("etaSeconds")
+    if eta is None and total and speed:
+        eta = max(0, int((total - done) / speed))
+    out["etaSeconds"] = eta
     return out
 
 def find_output(job_id):
