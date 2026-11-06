@@ -35,7 +35,7 @@ import logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote, urljoin, quote
-from urllib.request import Request, urlopen, build_opener, HTTPRedirectHandler
+from urllib.request import Request, build_opener, HTTPRedirectHandler
 from html.parser import HTMLParser
 
 TOKEN = os.environ.get("WORKER_TOKEN", "")
