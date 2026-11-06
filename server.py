@@ -21,6 +21,8 @@ Environment:
 """
 import json
 import mimetypes
+import ipaddress
+import socket
 import os
 import re
 import shutil
@@ -33,7 +35,7 @@ import logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote, urljoin
-from urllib.request import Request, urlopen
+from urllib.request import Request, urlopen, build_opener, HTTPRedirectHandler
 from html.parser import HTMLParser
 
 TOKEN = os.environ.get("WORKER_TOKEN", "")
@@ -42,6 +44,9 @@ PORT = int(os.environ.get("PORT", "8080"))
 ROOT = Path(os.environ.get("DOWNLOAD_DIR", str(Path.home() / "downly-worker" / "downloads"))).expanduser()
 MAX_JOBS = max(1, int(os.environ.get("MAX_JOBS", "2")))
 JOB_TTL = max(300, int(os.environ.get("JOB_TTL_SECONDS", "86400")))
+ALLOW_PRIVATE_URLS = os.environ.get("ALLOW_PRIVATE_URLS", "false").lower() in {"1", "true", "yes"}
+MAX_STREAMS = max(1, int(os.environ.get("MAX_STREAMS", "2")))
+stream_slots = threading.BoundedSemaphore(MAX_STREAMS)
 ROOT.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -53,6 +58,37 @@ slots = threading.Semaphore(MAX_JOBS)
 
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".flv"}
 AUDIO_EXTS = {".mp3", ".m4a", ".opus", ".aac", ".wav", ".flac", ".ogg"}
+
+def validate_public_url(value):
+    parsed = urlparse(str(value or "").strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("Only valid HTTP(S) media URLs are supported")
+    if parsed.username or parsed.password:
+        raise ValueError("URLs containing embedded credentials are not supported")
+    host = parsed.hostname.rstrip(".").lower()
+    if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
+        if not ALLOW_PRIVATE_URLS:
+            raise ValueError("Local/private network URLs are disabled")
+    try:
+        addresses = {ipaddress.ip_address(host)}
+    except ValueError:
+        try:
+            addresses = {ipaddress.ip_address(item[4][0]) for item in socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)}
+        except OSError as exc:
+            raise ValueError("The media host could not be resolved") from exc
+    if not addresses:
+        raise ValueError("The media host did not resolve to an address")
+    if not ALLOW_PRIVATE_URLS and any(not address.is_global for address in addresses):
+        raise ValueError("Local/private network destinations are blocked")
+    return parsed
+
+class SafeRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        validate_public_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+safe_opener = build_opener(SafeRedirectHandler)
+
 
 def now():
     return int(time.time())
@@ -332,10 +368,12 @@ class MediaPageParser(HTMLParser):
             self.items.append({"url": absolute, "extension": ext or None, "mime": media_exts.get(ext) or mime_hint or None, "kind": "hls" if ext == "m3u8" else "dash" if ext == "mpd" else "direct"})
 
 def crawl_media_page(url):
+    validate_public_url(url)
     req = Request(url, headers={"User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36", "Accept": "text/html,application/xhtml+xml"})
-    with urlopen(req, timeout=20) as resp:
+    with safe_opener.open(req, timeout=20) as resp:
         content_type = (resp.headers.get("Content-Type") or "").lower()
         final_url = resp.geturl()
+        validate_public_url(final_url)
         raw = resp.read(3 * 1024 * 1024)
     if "text/html" not in content_type and "application/xhtml" not in content_type:
         ext = Path(urlparse(final_url).path).suffix.lower().lstrip(".")
@@ -493,14 +531,75 @@ def execute_job(job_id):
 
 def stream_media(handler, query):
     url = (query.get("url") or [""])[0].strip()
+    direct_url = (query.get("direct_url") or [""])[0].strip()
     requested_format = (query.get("format") or ["best"])[0].strip() or "best"
     audio_only = (query.get("audio_only") or ["false"])[0].lower() == "true"
     filename = safe_name(unquote((query.get("filename") or [""])[0]).strip())
-    if not re.match(r"^https?://", url, re.I):
-        handler.send_json(400, {"error": "url must be http/https"})
+    try:
+        validate_public_url(url)
+        if direct_url:
+            validate_public_url(direct_url)
+    except ValueError as e:
+        handler.send_json(400, {"error": str(e)})
         return
     if len(requested_format) > 300 or any(x in requested_format for x in [";", "\n", "\r"]):
         handler.send_json(400, {"error": "invalid format selector"})
+        return
+
+    # Single-file progressive sources are proxied byte-for-byte without yt-dlp or disk I/O.
+    if direct_url and not audio_only:
+        if not stream_slots.acquire(blocking=False):
+            handler.send_json(503, {"error": "All download streams are busy. Retry shortly."})
+            return
+        upstream = None
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36",
+            "Accept": "*/*",
+        }
+        referer = (query.get("referer") or [url])[0]
+        if referer:
+            headers["Referer"] = referer
+        if handler.headers.get("Range"):
+            headers["Range"] = handler.headers.get("Range")
+        try:
+            upstream = safe_opener.open(Request(direct_url, headers=headers), timeout=30)
+            validate_public_url(upstream.geturl())
+            handler.send_response(upstream.status)
+            handler.send_header("Content-Type", upstream.headers.get("Content-Type") or "application/octet-stream")
+            handler.send_header("Content-Disposition", 'attachment; filename="' + filename.replace('"', "") + '"')
+            handler.send_header("Cache-Control", "no-store, no-transform")
+            handler.send_header("X-Content-Type-Options", "nosniff")
+            handler.send_header("Accept-Ranges", upstream.headers.get("Accept-Ranges", "none"))
+            for header in ("Content-Length", "Content-Range"):
+                if upstream.headers.get(header):
+                    handler.send_header(header, upstream.headers.get(header))
+            handler.end_headers()
+            sent = 0
+            while True:
+                chunk = upstream.read(1024 * 1024)
+                if not chunk:
+                    break
+                handler.wfile.write(chunk)
+                handler.wfile.flush()
+                sent += len(chunk)
+            log.info("direct stream complete bytes=%s", sent)
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            log.info("direct stream disconnected/error: %s", e)
+        except Exception as e:
+            log.exception("direct stream failed")
+            if not getattr(handler, "_headers_sent", False):
+                try:
+                    handler.send_json(502, {"error": "Direct source could not be streamed. Retry with conversion."})
+                except Exception:
+                    pass
+        finally:
+            if upstream:
+                upstream.close()
+            stream_slots.release()
+        return
+
+    if not stream_slots.acquire(blocking=False):
+        handler.send_json(503, {"error": "All download streams are busy. Retry shortly."})
         return
 
     if audio_only:
@@ -544,6 +643,7 @@ def stream_media(handler, query):
     except Exception as e:
         log.exception("stream spawn failed")
         handler.send_json(500, {"error": "Unable to start media stream", "detail": str(e)})
+        stream_slots.release()
         return
 
     def drain_pipe(pipe, prefix):
@@ -589,6 +689,7 @@ def stream_media(handler, query):
                 try: os.killpg(proc.pid, signal.SIGKILL)
                 except Exception: pass
         log.info("stream finished bytes=%s yt_rc=%s", sent, yt.returncode)
+        stream_slots.release()
 
 
 def auth(handler):
@@ -691,10 +792,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if parts == ["v1", "inspect"]:
             url = str(body.get("url", "")).strip()
-            if not re.match(r"^https?://", url, re.I):
-                self.send_json(400, {"error": "url must be http/https"})
-                return
             try:
+                validate_public_url(url)
                 data = inspect_url(url)
                 self.send_json(200, data)
             except subprocess.TimeoutExpired:
@@ -706,8 +805,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if parts == ["v1", "jobs"]:
             url = str(body.get("url", "")).strip()
-            if not re.match(r"^https?://", url, re.I):
-                self.send_json(400, {"error": "url must be http/https"})
+            try:
+                validate_public_url(url)
+            except ValueError as e:
+                self.send_json(400, {"error": str(e)})
                 return
             job_id = uuid.uuid4().hex
             d = job_dir(job_id); d.mkdir(parents=True, exist_ok=False)
