@@ -32,7 +32,9 @@ import uuid
 import logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, unquote, urljoin
+from urllib.request import Request, urlopen
+from html.parser import HTMLParser
 
 TOKEN = os.environ.get("WORKER_TOKEN", "")
 HOST = os.environ.get("HOST", "127.0.0.1")
