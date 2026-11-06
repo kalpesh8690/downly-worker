@@ -327,13 +327,19 @@ class MediaPageParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.base_url = base_url
         self.items = []
+        self.links = []
         self.title = ""
         self._in_title = False
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
-        if tag.lower() == "title":
+        tag = tag.lower()
+        if tag == "title":
             self._in_title = True
+        if tag == "a" and attrs.get("href"):
+            self.links.append(urljoin(self.base_url, attrs["href"]))
+        if tag == "iframe" and attrs.get("src"):
+            self.links.append(urljoin(self.base_url, attrs["src"]))
         for key in ("src", "href", "content", "data-src", "data-video", "data-url"):
             value = attrs.get(key)
             if value and isinstance(value, str):
@@ -367,25 +373,88 @@ class MediaPageParser(HTMLParser):
         if not any(x["url"] == absolute for x in self.items):
             self.items.append({"url": absolute, "extension": ext or None, "mime": media_exts.get(ext) or mime_hint or None, "kind": "hls" if ext == "m3u8" else "dash" if ext == "mpd" else "direct"})
 
-def crawl_media_page(url):
+def crawl_media_page(url, max_pages=6):
     validate_public_url(url)
-    req = Request(url, headers={"User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36", "Accept": "text/html,application/xhtml+xml"})
-    with safe_opener.open(req, timeout=20) as resp:
-        content_type = (resp.headers.get("Content-Type") or "").lower()
-        final_url = resp.geturl()
-        validate_public_url(final_url)
-        raw = resp.read(3 * 1024 * 1024)
-    if "text/html" not in content_type and "application/xhtml" not in content_type:
-        ext = Path(urlparse(final_url).path).suffix.lower().lstrip(".")
-        return {"ok": True, "pageUrl": final_url, "title": Path(urlparse(final_url).path).name or "Media", "items": [{"url": final_url, "extension": ext, "mime": content_type, "kind": "direct"}]}
-    parser = MediaPageParser(final_url)
-    parser.feed(raw.decode("utf-8", "replace"))
-    # Also catch media URLs embedded in JSON/config/script text.
-    text = raw.decode("utf-8", "replace")
-    patterns = re.findall(r'https?[^"\'<>\s]+\.(?:mp4|webm|m4v|mov|mkv|mp3|m4a|m3u8|mpd)(?:\?[^"\'<>\s]*)?', text, re.I)
-    for value in patterns:
-        parser._add(value, "script", "")
-    return {"ok": True, "pageUrl": final_url, "title": parser.title.strip() or "Detected media", "items": parser.items[:100], "count": len(parser.items)}
+    root = urlparse(url)
+    root_origin = (root.scheme, root.netloc)
+    queue = [url]
+    visited = set()
+    media = {}
+    titles = []
+    pages_scanned = 0
+    max_queue = 30
+
+    while queue and pages_scanned < max_pages:
+        page_url = queue.pop(0)
+        if page_url in visited:
+            continue
+        visited.add(page_url)
+        try:
+            validate_public_url(page_url)
+            req = Request(page_url, headers={
+                "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml"
+            })
+            with safe_opener.open(req, timeout=20) as resp:
+                content_type = (resp.headers.get("Content-Type") or "").lower()
+                final_url = resp.geturl()
+                validate_public_url(final_url)
+                raw = resp.read(3 * 1024 * 1024)
+        except Exception as e:
+            log.info("crawler skipped page=%s reason=%s", page_url, e)
+            continue
+
+        pages_scanned += 1
+        if "text/html" not in content_type and "application/xhtml" not in content_type:
+            ext = Path(urlparse(final_url).path).suffix.lower().lstrip(".")
+            media[final_url] = {"url": final_url, "extension": ext or None, "mime": content_type, "kind": "direct"}
+            continue
+
+        parser = MediaPageParser(final_url)
+        decoded = raw.decode("utf-8", "replace")
+        try:
+            parser.feed(decoded)
+        except Exception:
+            pass
+        if parser.title.strip():
+            titles.append(parser.title.strip())
+
+        # Capture media URLs embedded in JSON/player configuration scripts.
+        patterns = re.findall(r'https?[^"\'<>\s]+\.(?:mp4|webm|m4v|mov|mkv|mp3|m4a|aac|wav|ogg|m3u8|mpd)(?:\?[^"\'<>\s]*)?', decoded, re.I)
+        for value in patterns:
+            parser._add(value, "script", "")
+        for item in parser.items:
+            media[item["url"]] = item
+
+        # Only crawl normal pages on the starting origin; never spider the open web.
+        if (urlparse(final_url).scheme, urlparse(final_url).netloc) != root_origin:
+            continue
+        for link in parser.links:
+            if len(queue) >= max_queue:
+                break
+            try:
+                parsed = urlparse(link)
+                if (parsed.scheme, parsed.netloc) != root_origin:
+                    continue
+                path_ext = Path(parsed.path.lower()).suffix
+                if path_ext and path_ext not in {".html", ".htm", ".php", ".asp", ".aspx"}:
+                    continue
+                if link not in visited and link not in queue:
+                    queue.append(link)
+            except Exception:
+                continue
+
+    items = list(media.values())[:150]
+    return {
+        "ok": True,
+        "pageUrl": url,
+        "title": titles[0] if titles else "Detected media",
+        "items": items,
+        "count": len(items),
+        "pagesScanned": pages_scanned,
+        "partial": bool(queue and pages_scanned >= max_pages),
+    }
+
 
 def run_job(job_id):
     with lock:
