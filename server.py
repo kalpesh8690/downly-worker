@@ -29,6 +29,7 @@ import subprocess
 import threading
 import time
 import uuid
+import logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -40,6 +41,9 @@ ROOT = Path(os.environ.get("DOWNLOAD_DIR", str(Path.home() / "downly-worker" / "
 MAX_JOBS = max(1, int(os.environ.get("MAX_JOBS", "2")))
 JOB_TTL = max(300, int(os.environ.get("JOB_TTL_SECONDS", "86400")))
 ROOT.mkdir(parents=True, exist_ok=True)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("downly-worker")
 
 jobs = {}
 lock = threading.RLock()
@@ -85,7 +89,7 @@ def load_jobs():
             continue
         if m.get("status") in {"running", "paused", "queued"}:
             m["status"] = "interrupted"
-            m["error"] = "Worker restarted; resume requires a new worker process."
+            m["error"] = "Worker restarted; job can be resumed."
             m["updatedAt"] = now()
             write_meta(m)
         jobs[d.name] = m
@@ -155,7 +159,7 @@ def execute_job(job_id):
         out_tpl = str(d / "%(title).180B.%(ext)s")
         cmd = [
             "yt-dlp", "--no-playlist", "--newline",
-            "--continue", "--no-overwrites",
+            "--continue", "--no-overwrites", "--no-cache-dir",
             "--retries", "10", "--fragment-retries", "10",
             "--retry-sleep", "http:linear=1::2",
             "--socket-timeout", "30",
@@ -163,12 +167,17 @@ def execute_job(job_id):
             "--print", "after_move:filepath",
             "-o", out_tpl,
         ]
+        requested_format = str(m.get("format") or "best").lower()
         if m.get("audio_only"):
             cmd += ["-x", "--audio-format", "mp3", "--audio-quality", "192K"]
-        else:
+        elif requested_format in {"best", "original"}:
             cmd += ["-f", "bv*+ba/b", "--merge-output-format", "mp4"]
+        else:
+            cmd += ["-f", requested_format]
         cmd += [m["url"]]
 
+        log.info("job=%s start url=%s audio_only=%s format=%s", job_id, m.get("url"), m.get("audio_only"), m.get("format"))
+        log.info("job=%s command=%s", job_id, " ".join(cmd[:-1]) + " <url>")
         proc = subprocess.Popen(
             cmd, cwd=str(d), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1, start_new_session=True
@@ -181,6 +190,8 @@ def execute_job(job_id):
         final_path = None
         for line in proc.stdout:
             line = line.rstrip()
+            if line:
+                log.info("job=%s yt-dlp: %s", job_id, line)
             pct, speed = parse_progress(line)
             with lock:
                 m = jobs.get(job_id)
@@ -215,6 +226,7 @@ def execute_job(job_id):
             if rc != 0:
                 m["status"] = "failed"
                 m["error"] = f"yt-dlp exited with code {rc}"
+                log.error("job=%s failed rc=%s", job_id, rc)
                 m["updatedAt"] = now()
                 write_meta(m)
                 return
@@ -223,6 +235,7 @@ def execute_job(job_id):
             if not final_path:
                 m["status"] = "failed"
                 m["error"] = "Download completed but output file was not found"
+                log.error("job=%s output file missing", job_id)
             else:
                 size = final_path.stat().st_size
                 ext = final_path.suffix.lower().lstrip(".")
@@ -242,6 +255,7 @@ def execute_job(job_id):
                 })
             write_meta(m)
     except Exception as e:
+        log.exception("job=%s crashed", job_id)
         with lock:
             m = jobs.get(job_id)
             if m:
@@ -287,6 +301,7 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def do_GET(self):
+        log.info("request GET %s", self.path)
         if self.path == "/health":
             self.send_json(200, {"ok": True, "service": "downly-worker", "version": "2.0.0", "jobs": len(jobs), "maxJobs": MAX_JOBS})
             return
@@ -313,6 +328,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(404, {"error": "not found"})
 
     def do_HEAD(self):
+        log.info("request HEAD %s", self.path)
         if not self.require_auth():
             return
         parts = [x for x in urlparse(self.path).path.split("/") if x]
@@ -322,6 +338,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(404); self.end_headers()
 
     def do_POST(self):
+        log.info("request POST %s", self.path)
         if not self.require_auth():
             return
         parts = [x for x in urlparse(self.path).path.split("/") if x]
@@ -342,11 +359,12 @@ class Handler(BaseHTTPRequestHandler):
                 "id": job_id, "url": url, "audio_only": bool(body.get("audio_only", False)),
                 "status": "queued", "progress": 0, "bytes": 0, "totalBytes": None,
                 "speedBps": 0, "etaSeconds": None, "createdAt": now(), "updatedAt": now(),
-                "filename": None, "extension": None, "mime": None, "pid": None,
+                "filename": None, "extension": None, "mime": None, "pid": None, "format": str(body.get("format") or "best"),
             }
             with lock:
                 jobs[job_id] = m
                 write_meta(m)
+            log.info("job=%s created", job_id)
             run_job(job_id)
             self.send_json(202, enrich(m))
             return
@@ -357,6 +375,7 @@ class Handler(BaseHTTPRequestHandler):
                 m = jobs.get(job_id)
             if not m:
                 self.send_json(404, {"error": "job not found"}); return
+            log.info("job=%s action=%s status=%s", job_id, action, m.get("status"))
             if action == "pause":
                 if m.get("pid") and m.get("status") == "running":
                     try:
