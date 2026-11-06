@@ -435,49 +435,63 @@ def stream_media(handler, query):
     if len(requested_format) > 300 or any(x in requested_format for x in [";", "\n", "\r"]):
         handler.send_json(400, {"error": "invalid format selector"})
         return
-    if not filename:
-        filename = "downly-download.mp3" if audio_only else "downly-download.mp4"
+
     if audio_only:
         if not filename.lower().endswith(".mp3"):
             filename += ".mp3"
         mime = "audio/mpeg"
-        cmd = [
+        yt_cmd = [
             "yt-dlp", "--no-playlist", "--no-warnings", "--no-cache-dir",
             "--retries", "10", "--fragment-retries", "10", "--socket-timeout", "30",
             "-f", "ba/b", "-o", "-", url
+        ]
+        output_cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
+            "-vn", "-c:a", "libmp3lame", "-b:a", "192k", "-f", "mp3", "pipe:1"
         ]
     else:
         if not filename.lower().endswith((".mp4", ".webm", ".mkv", ".mov")):
             filename += ".mp4"
         mime = mimetypes.guess_type(filename)[0] or "video/mp4"
         fmt = requested_format if requested_format not in {"best", "original"} else "bv*+ba/b"
-        cmd = [
+        yt_cmd = [
             "yt-dlp", "--no-playlist", "--no-warnings", "--no-cache-dir",
             "--retries", "10", "--fragment-retries", "10", "--socket-timeout", "30",
             "--downloader", "ffmpeg", "-f", fmt, "-o", "-", url
         ]
+        output_cmd = None
 
     log.info("stream start url=%s audio_only=%s format=%s filename=%s", url, audio_only, requested_format, filename)
     try:
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        yt = subprocess.Popen(
+            yt_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL, bufsize=0, start_new_session=True
         )
+        output = yt
+        if output_cmd:
+            output = subprocess.Popen(
+                output_cmd, stdin=yt.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                bufsize=0, start_new_session=True
+            )
+            yt.stdout.close()
     except Exception as e:
         log.exception("stream spawn failed")
         handler.send_json(500, {"error": "Unable to start media stream", "detail": str(e)})
         return
 
-    def drain_stderr():
+    def drain_pipe(pipe, prefix):
         try:
-            for raw in proc.stderr:
+            for raw in pipe:
                 line = raw.decode("utf-8", "replace").rstrip()
                 if line:
-                    log.info("stream yt-dlp: %s", line)
+                    log.info("%s %s", prefix, line)
         except Exception:
             pass
 
-    threading.Thread(target=drain_stderr, daemon=True).start()
+    threading.Thread(target=drain_pipe, args=(yt.stderr, "stream yt-dlp:"), daemon=True).start()
+    if output is not yt:
+        threading.Thread(target=drain_pipe, args=(output.stderr, "stream ffmpeg:"), daemon=True).start()
+
     handler.send_response(200)
     handler.send_header("Content-Type", mime)
     handler.send_header("Content-Disposition", 'attachment; filename="' + filename.replace('"', "") + '"')
@@ -489,7 +503,7 @@ def stream_media(handler, query):
     sent = 0
     try:
         while True:
-            chunk = proc.stdout.read(1024 * 1024)
+            chunk = output.stdout.read(1024 * 1024)
             if not chunk:
                 break
             handler.wfile.write(chunk)
@@ -497,18 +511,18 @@ def stream_media(handler, query):
             sent += len(chunk)
     except (BrokenPipeError, ConnectionResetError, OSError):
         log.info("stream client disconnected after %s bytes", sent)
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except Exception:
-            pass
-    finally:
-        try:
-            rc = proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            try: os.killpg(proc.pid, signal.SIGKILL)
+        for proc in ([output, yt] if output is not yt else [yt]):
+            try: os.killpg(proc.pid, signal.SIGTERM)
             except Exception: pass
-            rc = -9
-        log.info("stream finished bytes=%s rc=%s", sent, rc)
+    finally:
+        for proc in ([output, yt] if output is not yt else [yt]):
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                try: os.killpg(proc.pid, signal.SIGKILL)
+                except Exception: pass
+        log.info("stream finished bytes=%s yt_rc=%s", sent, yt.returncode)
+
 
 def auth(handler):
     if not TOKEN:
