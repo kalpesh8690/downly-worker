@@ -55,9 +55,9 @@ All /v1 routes except GET /health require:
 | Method | Route | Purpose |
 |---|---|---|
 | GET | /health | Worker liveness and concurrency |
-| POST | /v1/inspect | Metadata and exact available format discovery |
-| GET | /v1/crawl?url=... | Bounded same-origin media page crawl |
-| GET | /v1/stream?url=... | Live attachment stream; direct_url may be supplied for progressive files |
+| POST | /v1/inspect | Metadata and available format discovery |
+| POST | /v1/crawl | Bounded same-origin media page crawl; body contains url |
+| POST | /v1/stream | Live attachment stream; body contains url, optional direct_url, format, filename and audio_only |
 | POST | /v1/jobs | Create a persistent job |
 | GET | /v1/jobs/:id | Read job status |
 | POST | /v1/jobs/:id/pause | Pause a persistent job |
