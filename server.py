@@ -885,6 +885,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(400, {"error": str(e)})
             return
 
+        if parts == ["v1", "crawl"]:
+            page_url = str(body.get("url") or "").strip()
+            try:
+                self.send_json(200, crawl_media_page(page_url))
+            except Exception as e:
+                log.exception("crawler POST failed page=%s", safe_log_url(page_url))
+                self.send_json(422, {"ok": False, "error": str(e) or "Unable to crawl this page"})
+            return
+
         if parts == ["v1", "stream"]:
             stream_values = {
                 "url": [str(body.get("url") or "")],
