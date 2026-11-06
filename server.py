@@ -621,60 +621,122 @@ def stream_media(handler, query):
     referer = (query.get("referer") or [url])[0].strip() or url
     audio_only = (query.get("audio_only") or ["false"])[0].lower() == "true"
     filename = safe_name(unquote((query.get("filename") or [""])[0]).strip())
-    source = direct_url if direct_url else url
-    if not re.match(r"^https?://", source, re.I):
-        handler.send_json(400, {"error": "url must be http/https"})
+
+    # Validate both the page URL and any resolved CDN URL before opening sockets.
+    try:
+        validate_public_url(url)
+        if direct_url:
+            validate_public_url(direct_url)
+    except ValueError as e:
+        handler.send_json(400, {"error": str(e)})
         return
+
     if len(requested_format) > 300 or any(x in requested_format for x in [";", "\n", "\r"]):
         handler.send_json(400, {"error": "invalid format selector"})
         return
 
+    if not stream_slots.acquire(blocking=False):
+        handler.send_json(503, {"error": "All download streams are busy. Retry shortly."})
+        return
+
+    # Direct progressive sources are copied byte-for-byte. Redirects pass through
+    # SafeRedirectHandler, which validates every redirect destination.
     if direct_url and not audio_only:
-        if not filename.lower().endswith((".mp4", ".webm", ".m4v", ".mov", ".mkv", ".mp3", ".m4a", ".aac", ".wav", ".ogg", ".flac")):
-            filename += ".mp4"
-        mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-        # Fast path: let curl fetch the already-resolved media URL. This avoids
-        # starting a second yt-dlp extraction process for direct files.
-        cmd = ["curl", "-L", "--fail", "--silent", "--show-error", "--retry", "3",
-               "--connect-timeout", "15", "--max-time", "0", "-A",
-               "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36"]
-        if referer:
-            cmd += ["-e", referer]
-        cmd += ["--output", "-", direct_url]
-        output_cmd = None
-        input_proc = "curl"
-    elif audio_only:
+        upstream = None
+        response_started = False
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36",
+                "Accept": "*/*",
+            }
+            if referer:
+                headers["Referer"] = referer
+            if handler.headers.get("Range"):
+                headers["Range"] = handler.headers["Range"]
+
+            upstream = safe_opener.open(Request(direct_url, headers=headers), timeout=30)
+            validate_public_url(upstream.geturl())
+            content_type = upstream.headers.get("Content-Type") or mimetypes.guess_type(urlparse(direct_url).path)[0] or "application/octet-stream"
+            if not Path(filename).suffix:
+                ext = mimetypes.guess_extension(content_type) or ".mp4"
+                filename += ext
+            handler.send_response(upstream.status)
+            handler.send_header("Content-Type", content_type)
+            handler.send_header("Content-Disposition", content_disposition(filename))
+            handler.send_header("Cache-Control", "no-store, no-transform")
+            handler.send_header("X-Content-Type-Options", "nosniff")
+            handler.send_header("Accept-Ranges", upstream.headers.get("Accept-Ranges", "none"))
+            for header in ("Content-Length", "Content-Range"):
+                if upstream.headers.get(header):
+                    handler.send_header(header, upstream.headers[header])
+            handler.end_headers()
+            response_started = True
+
+            sent = 0
+            while True:
+                chunk = upstream.read(1024 * 1024)
+                if not chunk:
+                    break
+                handler.wfile.write(chunk)
+                handler.wfile.flush()
+                sent += len(chunk)
+            log.info("direct stream complete bytes=%s", sent)
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            log.info("direct stream disconnected/error: %s", e)
+            if not response_started:
+                try:
+                    handler.send_json(502, {"error": "The direct media source could not be opened."})
+                except Exception:
+                    pass
+        except Exception:
+            log.exception("direct stream failed")
+            if not response_started:
+                try:
+                    handler.send_json(502, {"error": "The direct media source could not be streamed."})
+                except Exception:
+                    pass
+        finally:
+            if upstream:
+                upstream.close()
+            stream_slots.release()
+        return
+
+    if audio_only:
         if not filename.lower().endswith(".mp3"):
             filename += ".mp3"
         mime = "audio/mpeg"
-        yt_cmd = [
+        input_cmd = [
             "yt-dlp", "--no-playlist", "--no-warnings", "--no-cache-dir",
             "--retries", "10", "--fragment-retries", "10", "--socket-timeout", "30",
             "-f", "ba/b", "-o", "-", url
         ]
-        cmd = yt_cmd
         output_cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
             "-vn", "-c:a", "libmp3lame", "-b:a", "192k", "-f", "mp3", "pipe:1"
         ]
-        input_proc = "yt-dlp"
+        input_name = "yt-dlp"
     else:
         if not filename.lower().endswith((".mp4", ".webm", ".m4v", ".mov", ".mkv")):
             filename += ".mp4"
         mime = mimetypes.guess_type(filename)[0] or "video/mp4"
         fmt = requested_format if requested_format not in {"best", "original"} else "bv*+ba/b"
-        cmd = [
+        input_cmd = [
             "yt-dlp", "--no-playlist", "--no-warnings", "--no-cache-dir",
             "--retries", "10", "--fragment-retries", "10", "--socket-timeout", "30",
-            "--downloader", "ffmpeg", "-f", fmt, "-o", "-", url
+            "-f", fmt, "--downloader", "ffmpeg", "--merge-output-format", "mp4", "-o", "-", url
         ]
         output_cmd = None
-        input_proc = "yt-dlp"
+        input_name = "yt-dlp"
 
-    log.info("stream start source=%s direct=%s audio_only=%s format=%s filename=%s", safe_log_url(source), bool(direct_url), audio_only, requested_format, filename)
+    log.info("stream start source=%s direct=%s audio_only=%s format=%s filename=%s",
+             safe_log_url(direct_url or url), bool(direct_url), audio_only, requested_format, filename)
+    processes = []
     try:
-        first = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                 stdin=subprocess.DEVNULL, bufsize=0, start_new_session=True)
+        first = subprocess.Popen(
+            input_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL, bufsize=0, start_new_session=True
+        )
+        processes.append(first)
         output = first
         if output_cmd:
             output = subprocess.Popen(
@@ -682,13 +744,22 @@ def stream_media(handler, query):
                 bufsize=0, start_new_session=True
             )
             first.stdout.close()
-    except FileNotFoundError as e:
-        log.exception("stream executable missing: %s", e)
-        handler.send_json(500, {"error": "Required download tool is not installed on the worker"})
+            processes.append(output)
+    except FileNotFoundError:
+        log.exception("required stream executable missing")
+        handler.send_json(500, {"error": "A required media tool is not installed on the worker."})
+        for proc in processes:
+            try: os.killpg(proc.pid, signal.SIGTERM)
+            except Exception: pass
+        stream_slots.release()
         return
-    except Exception as e:
-        log.exception("stream spawn failed")
-        handler.send_json(500, {"error": "Unable to start media stream"})
+    except Exception:
+        log.exception("stream process could not start")
+        handler.send_json(500, {"error": "Unable to start media processing."})
+        for proc in processes:
+            try: os.killpg(proc.pid, signal.SIGTERM)
+            except Exception: pass
+        stream_slots.release()
         return
 
     def drain_pipe(pipe, prefix):
@@ -700,13 +771,13 @@ def stream_media(handler, query):
         except Exception:
             pass
 
-    threading.Thread(target=drain_pipe, args=(first.stderr, "stream "+input_proc+":"), daemon=True).start()
+    threading.Thread(target=drain_pipe, args=(first.stderr, "stream " + input_name + ":"), daemon=True).start()
     if output is not first:
         threading.Thread(target=drain_pipe, args=(output.stderr, "stream ffmpeg:"), daemon=True).start()
 
     handler.send_response(200)
     handler.send_header("Content-Type", mime)
-    handler.send_header("Content-Disposition", 'attachment; filename="' + filename.replace('"', "") + '"')
+    handler.send_header("Content-Disposition", content_disposition(filename))
     handler.send_header("Cache-Control", "no-store, no-transform")
     handler.send_header("X-Content-Type-Options", "nosniff")
     handler.send_header("Accept-Ranges", "none")
@@ -723,17 +794,18 @@ def stream_media(handler, query):
             sent += len(chunk)
     except (BrokenPipeError, ConnectionResetError, OSError):
         log.info("stream client disconnected after %s bytes", sent)
-        for proc in ([output, first] if output is not first else [first]):
+        for proc in processes:
             try: os.killpg(proc.pid, signal.SIGTERM)
             except Exception: pass
     finally:
-        for proc in ([output, first] if output is not first else [first]):
+        for proc in processes:
             try:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 try: os.killpg(proc.pid, signal.SIGKILL)
                 except Exception: pass
         log.info("stream finished bytes=%s rc=%s", sent, first.returncode)
+        stream_slots.release()
 
 
 def auth(handler):
