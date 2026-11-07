@@ -117,26 +117,14 @@ def stream_info(stream):
 def make_youtube(url, on_progress_callback=None):
     if not valid_youtube_url(url):
         raise ValueError("Invalid YouTube URL")
-    # Render/cloud IPs are commonly challenged by the WEB client. TV is a
-    # supported pytubefix client and is used first; WEB remains a fallback.
-    requested = os.environ.get("YT_CLIENT", "TV").upper()
-    clients = []
-    for client in [requested, "TV", "WEB"]:
-        if client not in clients:
-            clients.append(client)
-    last_error = None
-    for client in clients:
-        try:
-            yt = YouTube(url, client=client, on_progress_callback=on_progress_callback)
-            # Force stream metadata resolution so bot/playability errors are
-            # caught here and the next client can be attempted.
-            _ = yt.streams
-            print(f"[pytubefix] YouTube client={client} accepted")
-            return yt
-        except Exception as exc:
-            last_error = exc
-            print(f"[pytubefix] YouTube client={client} failed: {exc}")
-    raise last_error or RuntimeError("Unable to access YouTube")
+    # Use one client per request. Falling through multiple YouTube clients
+    # multiplies requests and can turn a temporary 429 into a rate-limit loop.
+    client = os.environ.get("YT_CLIENT", "TV").upper()
+    return YouTube(url, client=client, on_progress_callback=on_progress_callback)
+
+def is_rate_limited(exc):
+    msg = str(exc).lower()
+    return "429" in msg or "too many requests" in msg or "rate limit" in msg
 
 def get_stream(url, itag):
     yt = make_youtube(url)
@@ -388,6 +376,48 @@ class Handler(BaseHTTPRequestHandler):
         if not valid_youtube_url(url):
             self.send_json(400, {"ok": False, "error": "Invalid YouTube URL"})
             return
+
+        key = url
+        t = now()
+        with lock:
+            cached = info_cache.get(key)
+            if cached and t - cached["time"] < 120:
+                self.send_json(200, cached["data"])
+                return
+            blocked_until = rate_limited_until.get(key, 0)
+            if blocked_until > t:
+                self.send_json(429, {
+                    "ok": False, "success": False,
+                    "error": "YouTube rate limit is active. Please wait before retrying.",
+                    "retryAfter": blocked_until - t
+                })
+                return
+            event = info_inflight.get(key)
+            if event is None:
+                event = threading.Event()
+                info_inflight[key] = event
+                owner = True
+            else:
+                owner = False
+
+        if not owner:
+            event.wait(timeout=45)
+            with lock:
+                cached = info_cache.get(key)
+                blocked_until = rate_limited_until.get(key, 0)
+            if cached and t <= cached["time"] + 120:
+                self.send_json(200, cached["data"])
+                return
+            if blocked_until > now():
+                self.send_json(429, {
+                    "ok": False, "success": False,
+                    "error": "YouTube rate limit is active. Please wait before retrying.",
+                    "retryAfter": blocked_until - now()
+                })
+                return
+            self.send_json(503, {"ok": False, "error": "Inspection is still in progress. Retry shortly."})
+            return
+
         try:
             yt = make_youtube(url)
             formats = []
@@ -406,23 +436,32 @@ class Handler(BaseHTTPRequestHandler):
                 )
             )
 
-            self.send_json(200, {
-                "ok": True,
-                "success": True,
-                "url": url,
-                "id": yt.video_id,
-                "title": yt.title,
-                "author": yt.author,
-                "thumbnail": yt.thumbnail_url,
-                "duration": yt.length,
-                "durationString": str(yt.length),
-                "viewCount": getattr(yt, "views", None),
-                "webpageUrl": url,
-                "formatCount": len(formats),
-                "formats": formats[:120],
-            })
+            payload = {
+                "ok": True, "success": True, "url": url,
+                "id": yt.video_id, "title": yt.title, "author": yt.author,
+                "thumbnail": yt.thumbnail_url, "duration": yt.length,
+                "durationString": str(yt.length), "viewCount": getattr(yt, "views", None),
+                "webpageUrl": url, "formatCount": len(formats), "formats": formats[:120],
+            }
+            with lock:
+                info_cache[key] = {"time": now(), "data": payload}
+                rate_limited_until.pop(key, None)
+            self.send_json(200, payload)
         except Exception as exc:
-            self.send_json(422, {"ok": False, "success": False, "error": str(exc)})
+            if is_rate_limited(exc):
+                with lock:
+                    rate_limited_until[key] = now() + 60
+                self.send_json(429, {
+                    "ok": False, "success": False,
+                    "error": "YouTube returned HTTP 429 Too Many Requests. The worker has stopped retrying this URL for 60 seconds.",
+                    "retryAfter": 60
+                })
+            else:
+                self.send_json(422, {"ok": False, "success": False, "error": str(exc)})
+        finally:
+            with lock:
+                info_inflight.pop(key, None)
+                event.set()
 
     def stream_body(self, data):
         url = str(data.get("url") or "").strip()
