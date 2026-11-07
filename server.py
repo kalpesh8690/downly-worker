@@ -40,6 +40,10 @@ JOB_TTL = max(300, int(os.environ.get("JOB_TTL_SECONDS", "86400")))
 ROOT.mkdir(parents=True, exist_ok=True)
 
 jobs = {}
+# Shared inspection state prevents duplicate YouTube calls and suppresses retry storms.
+info_cache = {}
+info_inflight = {}
+rate_limited_until = {}
 lock = threading.RLock()
 slots = threading.Semaphore(MAX_JOBS)
 
