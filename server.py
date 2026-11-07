@@ -335,7 +335,7 @@ def inspect_url(url):
             "height": height,
             "width": width,
             "fps": f.get("fps"),
-            "filesize": f.get("filesize") or f.get("filesize_approx"),
+            "filesize": f.get("filesize") or f.get("filesize_approx") or (int(float(f.get("tbr") or 0) * 1000 * float(raw.get("duration") or 0) / 8) if f.get("tbr") and raw.get("duration") else None),
             "tbr": f.get("tbr"),
             "vcodec": vcodec,
             "acodec": acodec,
@@ -649,6 +649,7 @@ def stream_media(handler, query):
     requested_format = (query.get("format") or ["best"])[0].strip() or "best"
     referer = (query.get("referer") or [url])[0].strip() or url
     audio_only = (query.get("audio_only") or ["false"])[0].lower() == "true"
+    preview = (query.get("preview") or ["false"])[0].lower() == "true"
     filename = safe_name(unquote((query.get("filename") or [""])[0]).strip())
 
     # Validate both the page URL and any resolved CDN URL before opening sockets.
@@ -691,7 +692,7 @@ def stream_media(handler, query):
                 filename += ext
             handler.send_response(upstream.status)
             handler.send_header("Content-Type", content_type)
-            handler.send_header("Content-Disposition", content_disposition(filename))
+            handler.send_header("Content-Disposition", ('inline; filename="' + safe_name(filename).replace('"', "_") + '"' if preview else content_disposition(filename)))
             handler.send_header("Cache-Control", "no-store, no-transform")
             handler.send_header("X-Content-Type-Options", "nosniff")
             handler.send_header("Accept-Ranges", upstream.headers.get("Accept-Ranges", "none"))
