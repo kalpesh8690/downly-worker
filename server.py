@@ -117,8 +117,26 @@ def stream_info(stream):
 def make_youtube(url, on_progress_callback=None):
     if not valid_youtube_url(url):
         raise ValueError("Invalid YouTube URL")
-    # WEB client enables pytubefix automatic BotGuard/PO-token generation.
-    return YouTube(url, client="WEB", on_progress_callback=on_progress_callback)
+    # Render/cloud IPs are commonly challenged by the WEB client. TV is a
+    # supported pytubefix client and is used first; WEB remains a fallback.
+    requested = os.environ.get("YT_CLIENT", "TV").upper()
+    clients = []
+    for client in [requested, "TV", "WEB"]:
+        if client not in clients:
+            clients.append(client)
+    last_error = None
+    for client in clients:
+        try:
+            yt = YouTube(url, client=client, on_progress_callback=on_progress_callback)
+            # Force stream metadata resolution so bot/playability errors are
+            # caught here and the next client can be attempted.
+            _ = yt.streams
+            print(f"[pytubefix] YouTube client={client} accepted")
+            return yt
+        except Exception as exc:
+            last_error = exc
+            print(f"[pytubefix] YouTube client={client} failed: {exc}")
+    raise last_error or RuntimeError("Unable to access YouTube")
 
 def get_stream(url, itag):
     yt = make_youtube(url)
@@ -279,7 +297,7 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "service": "downly-worker",
                 "engine": "pytubefix",
-                "client": "WEB",
+                "client": os.environ.get("YT_CLIENT", "TV"),
                 "poToken": "automatic",
                 "version": "1.0.0",
                 "jobs": len(jobs),
