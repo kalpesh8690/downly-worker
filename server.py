@@ -907,6 +907,22 @@ class Handler(BaseHTTPRequestHandler):
         log.info("request POST %s", urlparse(self.path).path)
         if not self.require_auth():
             return
+        parsed = urlparse(self.path)
+        if parsed.path == "/v1/info":
+            try:
+                body = json_body(self)
+                page_url = str(body.get("url") or "").strip()
+                validate_public_url(page_url)
+                self.send_json(200, inspect_url(page_url))
+            except ValueError as e:
+                self.send_json(400, {"ok": False, "error": str(e)})
+            except Exception as e:
+                log.exception("info failed")
+                self.send_json(422, {"ok": False, "error": str(e) or "Unable to inspect this media URL"})
+            return
+        log.info("request POST %s", urlparse(self.path).path)
+        if not self.require_auth():
+            return
         parts = [x for x in urlparse(self.path).path.split("/") if x]
         try:
             body = json_body(self)
