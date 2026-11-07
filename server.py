@@ -114,10 +114,14 @@ def stream_info(stream):
         "includes_video": video,
     }
 
-def get_stream(url, itag):
+def make_youtube(url, on_progress_callback=None):
     if not valid_youtube_url(url):
         raise ValueError("Invalid YouTube URL")
-    yt = YouTube(url)
+    # WEB client enables pytubefix automatic BotGuard/PO-token generation.
+    return YouTube(url, client="WEB", on_progress_callback=on_progress_callback)
+
+def get_stream(url, itag):
+    yt = make_youtube(url)
     stream = yt.streams.get_by_itag(int(itag))
     if not stream:
         raise ValueError("Format not found")
@@ -165,7 +169,7 @@ def download_worker(job_id, url, itag, mode, output_format):
         temp.mkdir(parents=True, exist_ok=True)
         try:
             update_job(job_id, status="starting", progress=0)
-            yt = YouTube(url, on_progress_callback=progress_callback(job_id))
+            yt = make_youtube(url, on_progress_callback=progress_callback(job_id))
             update_job(job_id, title=yt.title, thumbnail=yt.thumbnail_url, status="downloading")
 
             selected = yt.streams.get_by_itag(int(itag))
@@ -275,6 +279,8 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "service": "downly-worker",
                 "engine": "pytubefix",
+                "client": "WEB",
+                "poToken": "automatic",
                 "version": "1.0.0",
                 "jobs": len(jobs),
                 "maxJobs": MAX_JOBS,
@@ -365,7 +371,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(400, {"ok": False, "error": "Invalid YouTube URL"})
             return
         try:
-            yt = YouTube(url)
+            yt = make_youtube(url)
             formats = []
             for stream in yt.streams:
                 try:
