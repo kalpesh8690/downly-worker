@@ -1,0 +1,6 @@
+# Downly Worker Python dependencies
+# Python 3.11+ recommended by yt-dlp.
+# ffmpeg/ffprobe and a supported JavaScript runtime are system packages,
+# not Python packages, and must be installed separately.
+
+yt-dlp[default]>=2026.10.26
