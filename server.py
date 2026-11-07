@@ -805,7 +805,7 @@ def stream_media(handler, query):
 
     handler.send_response(200)
     handler.send_header("Content-Type", mime)
-    handler.send_header("Content-Disposition", content_disposition(filename))
+    handler.send_header("Content-Disposition", ('inline; filename="' + safe_name(filename).replace('"', "_") + '"' if preview else content_disposition(filename)))
     handler.send_header("Cache-Control", "no-store, no-transform")
     handler.send_header("X-Content-Type-Options", "nosniff")
     handler.send_header("Accept-Ranges", "none")
@@ -977,6 +977,7 @@ class Handler(BaseHTTPRequestHandler):
                 "format": [str(body.get("format") or "best")],
                 "audio_only": ["true" if body.get("audio_only") is True or str(body.get("audio_only")).lower() == "true" else "false"],
                 "filename": [str(body.get("filename") or "")],
+                "preview": ["true" if body.get("preview") is True or str(body.get("preview")).lower() == "true" else "false"],
             }
             stream_media(self, stream_values)
             return
