@@ -48,7 +48,7 @@ MEDIA_EXTS = {
     "mpd": "application/dash+xml",
 }
 MEDIA_MIME_RE = re.compile(r"^(video|application/vnd.apple.mpegurl|application/x-mpegurl|application/dash\+xml)/", re.I)
-URL_RE = re.compile(r"https?://[^\s"'<>]+", re.I)
+URL_RE = re.compile(r'''https?://[^\s\"'<>]+''', re.I)
 
 jobs = {}
 lock = threading.RLock()
