@@ -19,12 +19,14 @@ Environment:
   MAX_JOBS           default 2
   JOB_TTL_SECONDS    default 86400
 """
+import base64
 import json
 import mimetypes
 import ipaddress
 import socket
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -41,6 +43,27 @@ from html.parser import HTMLParser
 TOKEN = os.environ.get("WORKER_TOKEN", "")
 JS_RUNTIME = os.environ.get("YTDLP_JS_RUNTIME", "node").strip() or "node"
 YT_DLP_JS_ARGS = ["--js-runtimes", JS_RUNTIME]
+YTDLP_USER_AGENT = os.environ.get("YTDLP_USER_AGENT", "").strip()
+YTDLP_EXTRACTOR_ARGS = os.environ.get("YTDLP_EXTRACTOR_ARGS", "").strip()
+YTDLP_COOKIES_FILE = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
+YTDLP_COOKIES_B64 = os.environ.get("YTDLP_COOKIES_B64", "").strip()
+YTDLP_COMMON_ARGS = ["--no-cache-dir", "--socket-timeout", "30", "--retries", "10", "--fragment-retries", "10"]
+if YTDLP_USER_AGENT:
+    YTDLP_COMMON_ARGS += ["--user-agent", YTDLP_USER_AGENT]
+if YTDLP_EXTRACTOR_ARGS:
+    YTDLP_COMMON_ARGS += ["--extractor-args", YTDLP_EXTRACTOR_ARGS]
+if YTDLP_COOKIES_FILE:
+    YTDLP_COMMON_ARGS += ["--cookies", YTDLP_COOKIES_FILE]
+elif YTDLP_COOKIES_B64:
+    try:
+        _cookie_path = Path(os.environ.get("DOWNLOAD_DIR", str(Path.home() / "downly-worker" / "downloads"))).expanduser().parent / "youtube-cookies.txt"
+        _cookie_path.parent.mkdir(parents=True, exist_ok=True)
+        _cookie_path.write_bytes(base64.b64decode(YTDLP_COOKIES_B64))
+        os.chmod(_cookie_path, 0o600)
+        YTDLP_COMMON_ARGS += ["--cookies", str(_cookie_path)]
+        YTDLP_COOKIES_FILE = str(_cookie_path)
+    except Exception:
+        YTDLP_COOKIES_FILE = ""
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8080"))
 ROOT = Path(os.environ.get("DOWNLOAD_DIR", str(Path.home() / "downly-worker" / "downloads"))).expanduser()
@@ -259,8 +282,8 @@ def parse_progress(line):
 
 def inspect_url(url):
     cmd = [
-        "yt-dlp", *YT_DLP_JS_ARGS, "--dump-single-json", "--skip-download", "--no-playlist",
-        "--no-warnings", "--no-cache-dir", "--socket-timeout", "20", "--verbose", url
+        "yt-dlp", *YT_DLP_JS_ARGS, *YTDLP_COMMON_ARGS, "--dump-single-json", "--skip-download", "--no-playlist",
+        "--no-warnings", "--verbose", url
     ]
     log.info("inspect url=%s", safe_log_url(url))
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
@@ -270,7 +293,7 @@ def inspect_url(url):
         joined = "\\n".join(lines[-30:])
         log.error("yt-dlp inspect failed rc=%s runtime=%s output=%s", proc.returncode, JS_RUNTIME, joined[:12000])
         if "Sign in to confirm you're not a bot" in output or "HTTP Error 429" in output:
-            raise BotBlockedError("YouTube is temporarily blocking this cloud server with an anti-bot check. Please retry later or use the local worker on your device.")
+            raise BotBlockedError("YouTube returned HTTP 429/login-required to this worker IP. The backend is healthy, but YouTube is blocking automated access. Configure authorized cookies via YTDLP_COOKIES_B64 and a matching YTDLP_USER_AGENT, or use the local worker.")
         raise RuntimeError(lines[-1] if lines else "Unable to inspect this media URL")
     raw = json.loads(output)
     formats = []
@@ -505,11 +528,8 @@ def execute_job(job_id):
         d = job_dir(job_id)
         out_tpl = str(d / "%(title).180B.%(ext)s")
         cmd = [
-            "yt-dlp", *YT_DLP_JS_ARGS, "--no-playlist", "--newline", "--progress-template", "download:%(progress.status)s|%(progress.percent)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.speed)s|%(progress.eta)s",
-            "--continue", "--no-overwrites", "--no-cache-dir",
-            "--retries", "10", "--fragment-retries", "10",
-            "--retry-sleep", "http:linear=1::2",
-            "--socket-timeout", "30",
+            "yt-dlp", *YT_DLP_JS_ARGS, *YTDLP_COMMON_ARGS, "--no-playlist", "--newline", "--progress-template", "download:%(progress.status)s|%(progress.percent)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.speed)s|%(progress.eta)s",
+            "--continue", "--no-overwrites", "--retry-sleep", "http:linear=1::2",
             "--restrict-filenames",
             "--print", "after_move:filepath",
             "-o", out_tpl,
@@ -715,8 +735,7 @@ def stream_media(handler, query):
             filename += ".mp3"
         mime = "audio/mpeg"
         input_cmd = [
-            "yt-dlp", *YT_DLP_JS_ARGS, "--no-playlist", "--no-warnings", "--no-cache-dir",
-            "--retries", "10", "--fragment-retries", "10", "--socket-timeout", "30",
+            "yt-dlp", *YT_DLP_JS_ARGS, *YTDLP_COMMON_ARGS, "--no-playlist", "--no-warnings",
             "-f", "ba/b", "-o", "-", url
         ]
         output_cmd = [
@@ -730,8 +749,7 @@ def stream_media(handler, query):
         mime = mimetypes.guess_type(filename)[0] or "video/mp4"
         fmt = requested_format if requested_format not in {"best", "original"} else "bv*+ba/b"
         input_cmd = [
-            "yt-dlp", "--no-playlist", "--no-warnings", "--no-cache-dir",
-            "--retries", "10", "--fragment-retries", "10", "--socket-timeout", "30",
+            "yt-dlp", *YT_DLP_JS_ARGS, *YTDLP_COMMON_ARGS, "--no-playlist", "--no-warnings",
             "-f", fmt, "--downloader", "ffmpeg", "--merge-output-format", "mp4", "-o", "-", url
         ]
         output_cmd = None
