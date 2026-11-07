@@ -264,7 +264,10 @@ def inspect_url(url):
     output = proc.stdout or ""
     if proc.returncode != 0:
         lines = [x.strip() for x in output.splitlines() if x.strip()]
-        log.error("yt-dlp inspect failed rc=%s runtime=%s output=%s", proc.returncode, JS_RUNTIME, "\\n".join(lines[-30:])[:12000])
+        joined = "\\n".join(lines[-30:])
+        log.error("yt-dlp inspect failed rc=%s runtime=%s output=%s", proc.returncode, JS_RUNTIME, joined[:12000])
+        if "Sign in to confirm you're not a bot" in output or "HTTP Error 429" in output:
+            raise BotBlockedError("YouTube is temporarily blocking this cloud server with an anti-bot check. Please retry later or use the local worker on your device.")
         raise RuntimeError(lines[-1] if lines else "Unable to inspect this media URL")
     raw = json.loads(output)
     formats = []
@@ -919,6 +922,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, inspect_url(page_url))
             except ValueError as e:
                 self.send_json(400, {"ok": False, "error": str(e)})
+            except BotBlockedError as e:
+                self.send_json(429, {"ok": False, "error": str(e), "code": "upstream_bot_check"})
             except Exception as e:
                 log.exception("info failed")
                 self.send_json(422, {"ok": False, "error": str(e) or "Unable to inspect this media URL"})
