@@ -39,6 +39,8 @@ from urllib.request import Request, build_opener, HTTPRedirectHandler
 from html.parser import HTMLParser
 
 TOKEN = os.environ.get("WORKER_TOKEN", "")
+JS_RUNTIME = os.environ.get("YTDLP_JS_RUNTIME", "node").strip() or "node"
+YT_DLP_JS_ARGS = ["--js-runtimes", JS_RUNTIME]
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8080"))
 ROOT = Path(os.environ.get("DOWNLOAD_DIR", str(Path.home() / "downly-worker" / "downloads"))).expanduser()
