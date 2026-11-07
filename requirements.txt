@@ -1,1 +1,1 @@
-pytubefix>=11.2.1,<12
+# No Python packages required. Uses only the standard library.\n
