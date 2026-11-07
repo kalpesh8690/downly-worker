@@ -254,14 +254,15 @@ def parse_progress(line):
 
 def inspect_url(url):
     cmd = [
-        "yt-dlp", "--dump-single-json", "--skip-download", "--no-playlist",
-        "--no-warnings", "--no-cache-dir", "--socket-timeout", "20", url
+        "yt-dlp", *YT_DLP_JS_ARGS, "--dump-single-json", "--skip-download", "--no-playlist",
+        "--no-warnings", "--no-cache-dir", "--socket-timeout", "20", "--verbose", url
     ]
     log.info("inspect url=%s", safe_log_url(url))
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
     output = proc.stdout or ""
     if proc.returncode != 0:
         lines = [x.strip() for x in output.splitlines() if x.strip()]
+        log.error("yt-dlp inspect failed rc=%s runtime=%s output=%s", proc.returncode, JS_RUNTIME, "\\n".join(lines[-30:])[:12000])
         raise RuntimeError(lines[-1] if lines else "Unable to inspect this media URL")
     raw = json.loads(output)
     formats = []
@@ -496,7 +497,7 @@ def execute_job(job_id):
         d = job_dir(job_id)
         out_tpl = str(d / "%(title).180B.%(ext)s")
         cmd = [
-            "yt-dlp", "--no-playlist", "--newline", "--progress-template", "download:%(progress.status)s|%(progress.percent)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.speed)s|%(progress.eta)s",
+            "yt-dlp", *YT_DLP_JS_ARGS, "--no-playlist", "--newline", "--progress-template", "download:%(progress.status)s|%(progress.percent)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.speed)s|%(progress.eta)s",
             "--continue", "--no-overwrites", "--no-cache-dir",
             "--retries", "10", "--fragment-retries", "10",
             "--retry-sleep", "http:linear=1::2",
@@ -706,7 +707,7 @@ def stream_media(handler, query):
             filename += ".mp3"
         mime = "audio/mpeg"
         input_cmd = [
-            "yt-dlp", "--no-playlist", "--no-warnings", "--no-cache-dir",
+            "yt-dlp", *YT_DLP_JS_ARGS, "--no-playlist", "--no-warnings", "--no-cache-dir",
             "--retries", "10", "--fragment-retries", "10", "--socket-timeout", "30",
             "-f", "ba/b", "-o", "-", url
         ]
