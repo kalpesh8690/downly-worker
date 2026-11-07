@@ -91,6 +91,9 @@ def validate_public_url(value):
         raise ValueError("Local/private network destinations are blocked")
     return parsed
 
+class BotBlockedError(RuntimeError):
+    pass
+
 class SafeRedirectHandler(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         validate_public_url(newurl)
